@@ -8,7 +8,7 @@
 variable "aws_region" {
   description = "AWS region to deploy resources"
   type        = string
-  default     = "ap-southeast-1"
+  default     = "ap-southeast-2"
 }
 
 // Flags to control resource deployment.
