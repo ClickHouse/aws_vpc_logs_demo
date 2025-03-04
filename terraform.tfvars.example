@@ -1,0 +1,112 @@
+# terraform.tfvars.example
+# Copy this file to terraform.tfvars and fill in your values
+
+# AWS Configuration
+aws_region = "ap-southeast-1"
+
+# Deployment Flags
+deploy_vpc = true
+deploy_s3 = true
+deploy_flow_logs = true
+deploy_simulator = true
+deploy_clickhouse = true
+deploy_clickpipe = true
+
+# VPC Configuration
+vpc_cidr = "10.0.0.0/16"
+vpc_id = ""  # Only needed if deploy_vpc is false
+
+# S3 Configuration
+s3_bucket_name = "ch-vpc-flow-logs-demo-001"
+s3_bucket_private = true
+s3_bucket_arn = ""  # Only needed if deploy_s3 is false
+
+# Flow Logs Configuration
+flow_logs_traffic_type = "ALL"
+max_aggregation_interval = 60
+
+# EC2 Simulator Configuration
+existing_subnet_id = ""  # Only needed if deploy_vpc is false and deploy_simulator is true
+
+# ClickHouse Service Configuration
+clickhouse_service_name = "VPCFlowLogs"
+clickhouse_region = "ap-southeast-2"
+clickhouse_ip_access = [
+  {
+    source      = "0.0.0.0/0"
+    description = "Allow all IPs (for development only)"
+  }
+]
+clickhouse_num_replicas = 1
+clickhouse_min_memory = 8
+clickhouse_max_memory = 8
+
+# ClickPipe Configuration
+clickpipe_format = "JSONEachRow"
+clickpipe_table_name = "vpc_flow_logs"
+clickpipe_is_continuous = true
+clickpipe_columns = [
+  {
+    name = "version"
+    type = "Int64"
+  },
+  {
+    name = "account_id"
+    type = "String"
+  },
+  {
+    name = "interface_id"
+    type = "String"
+  },
+  {
+    name = "srcaddr"
+    type = "String"
+  },
+  {
+    name = "dstaddr"
+    type = "String"
+  },
+  {
+    name = "srcport"
+    type = "Int64"
+  },
+  {
+    name = "dstport"
+    type = "Int64"
+  },
+  {
+    name = "protocol"
+    type = "Int64"
+  },
+  {
+    name = "packets"
+    type = "Int64"
+  },
+  {
+    name = "bytes"
+    type = "Int64"
+  },
+  {
+    name = "start"
+    type = "Int64"
+  },
+  {
+    name = "end"
+    type = "Int64"
+  },
+  {
+    name = "action"
+    type = "String"
+  },
+  {
+    name = "log_status"
+    type = "String"
+  }
+]
+
+# IAM Configuration
+# The IAM Role needs to start with the prefix "ClickHouseAccess-" 
+clickhouse_iam_role_name = "ClickHouseAccess-ClickPipe-S3-Demo"
+
+# Sensitive values should be placed in secret.tfvars file
+# See secret.tfvars.example for format

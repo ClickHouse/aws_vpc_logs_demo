@@ -102,7 +102,7 @@ resource "aws_instance" "simulator" {
   // Use the new subnet if deploying a new VPC; otherwise, use an existing subnet provided by the user.
   subnet_id = var.deploy_vpc ? aws_subnet.public[0].id : var.existing_subnet_id
 
-  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+  vpc_security_group_ids      = [aws_security_group.ec2_sg.id]
   associate_public_ip_address = true
 
   // User data script to continuously generate outbound HTTP traffic.
