@@ -181,6 +181,8 @@ This project demonstrates how to export AWS VPC Flow Logs to S3 and subsequently
    - Without this wait, the ClickPipe might attempt to use the IAM role before it's fully available
    - The 300-second wait ensures that IAM changes have propagated throughout AWS's global infrastructure
    - This prevents race conditions and "role not found" errors during deployment
+   - ClickPipes will check for data in the source location when it's being created and WILL FAIL, if no data is found.
+     - VPC Flow Logs takes about 3 to 5 mins to start landing data in the S3 bucket
 
 2. **Update Trust Policy (null_resource)**:
    - The ClickHouse service provides its own IAM role ARN that needs to be trusted
@@ -297,7 +299,7 @@ If you encounter issues with the ClickPipe not being able to access the S3 bucke
 1. Verify that the IAM role has the correct trust policy
 2. Check that the S3 bucket policy allows access from the ClickHouse service
 3. Ensure that the ClickHouse service has the correct IAM role ARN
-4. Wait for IAM propagation (can take up to 5 minutes)
+4. Wait for IAM propagation & S3 bucket to have some data (can take up to 5 minutes)
 
 For more detailed troubleshooting, check the AWS CloudTrail logs and ClickHouse Cloud logs.
 
