@@ -338,8 +338,8 @@ resource "clickhouse_clickpipe" "vpc_flow_logs" {
       type   = "s3"
       format = var.clickpipe_format
       url    = "s3://${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}/**"
-      # compression = "gzip"
-      delimiter      = " "
+      # compression = "gzip" # Leaving this here for now
+      # delimiter      = " " # Leaving this here for now
       authentication = "IAM_ROLE"
       iam_role       = aws_iam_role.clickhouse_role[0].arn
       is_continuous  = var.clickpipe_is_continuous
