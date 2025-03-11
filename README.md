@@ -1,24 +1,195 @@
-# VPC Flow Logs to Clickhouse Cloud Demo
+# VPC Flow Logs to ClickHouse Cloud
 
-This project demonstrates how to export AWS VPC Flow Logs to S3 and subsequently ingest them into Clickhouse Cloud. It includes Terraform configurations to set up the necessary AWS infrastructure and a traffic simulator for testing purposes.
+This project demonstrates how to export AWS VPC Flow Logs to S3 and subsequently ingest them into ClickHouse Cloud. It includes Terraform configurations to set up the necessary AWS infrastructure and a traffic simulator for testing purposes.
 
 ## Prerequisites
 
 - AWS CLI installed and configured with appropriate credentials
 - Terraform v1.10.0 or later
 - An AWS account with appropriate permissions
-- A Clickhouse Cloud account (for log ingestion)
+- A ClickHouse Cloud account (for log ingestion)
+- ClickHouse Cloud API credentials (organization ID, token key, and token secret)
 
-## Project Structure
+## Repository Structure
 
 ```
 .
-├── main.tf                 # Main Terraform configuration
-├── variables.tf            # Variable definitions
-├── outputs.tf             # Output definitions
-├── ec2_log_simulator.tf   # EC2 instance for traffic simulation
-└── .gitignore            # Git ignore file
+├── main.tf                   # Main Terraform configuration for all resources
+├── ec2_log_simulator.tf      # EC2 instance for traffic simulation
+├── variables.tf              # Variable definitions
+├── outputs.tf                # Output definitions
+├── terraform.tfvars.example  # Example variable values
+├── secret.tfvars.example     # Example for sensitive variables
+└── .gitignore                # Git ignore file
 ```
+
+## Components
+
+### 1. VPC and Networking (main.tf, ec2_log_simulator.tf)
+
+- Creates a new VPC with public subnet
+- Sets up Internet Gateway and route tables
+- Configurable via deployment flags
+
+### 2. S3 Bucket (main.tf)
+
+- Secure storage for VPC Flow Logs
+- Versioning enabled
+- Configurable public/private access
+- Bucket policies for log delivery
+
+### 3. VPC Flow Logs (main.tf)
+
+- Captures network traffic in your VPC
+- Configurable aggregation intervals
+- Logs stored in S3 bucket in Parquet format
+- Hourly partitioning enabled
+
+### 4. EC2 Traffic Simulator (ec2_log_simulator.tf)
+
+- Generates sample network traffic
+- Runs on Amazon Linux 2
+- Automatically sends HTTP requests to generate flow logs
+- Deployed as a systemd service
+
+### 5. ClickHouse Cloud Integration (main.tf)
+
+- Automatically provisions a ClickHouse Cloud service
+- Creates a ClickPipe to ingest VPC Flow Logs from S3
+- Configurable service tier and resources
+- Supports idle scaling to optimize costs
+
+### 6. IAM Integration (main.tf)
+
+- Creates IAM policy for S3 access
+- Sets up IAM role for ClickHouse to assume
+- Establishes trust relationship between AWS and ClickHouse
+
+## Execution Flow and Component Interdependencies
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│  VPC Creation   │────▶│  Subnet, IGW,   │────▶│  EC2 Simulator  │
+│                 │     │  Route Tables   │     │                 │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+                                                         │ Generates Traffic
+                                                         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│   S3 Bucket     │◀────│  VPC Flow Logs  │◀────│  Network Traffic│
+│                 │     │                 │     │                 │
+└────────┬────────┘     └─────────────────┘     └─────────────────┘
+         │
+         │ Stores Logs
+         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│ ClickHouse Cloud│────▶│   IAM Policy    │────▶│    IAM Role     │
+│    Service      │     │                 │     │                 │
+└────────┬────────┘     └─────────────────┘     └────────┬────────┘
+         │                                                │
+         │                                                │
+         ▼                                                ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│                 │     │                 │     │                 │
+│  Wait for IAM   │────▶│  Update Trust   │────▶│   ClickPipe     │
+│  Propagation    │     │     Policy      │     │                 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+### Component Explanations
+
+1. **VPC Creation**:
+
+   - Creates a new VPC with CIDR block specified in variables
+   - Enables DNS support and hostnames
+   - Serves as the foundation for all networking resources
+
+2. **Subnet, IGW, Route Tables**:
+
+   - Creates a public subnet within the VPC
+   - Sets up an Internet Gateway for external connectivity
+   - Configures route tables to allow traffic flow
+
+3. **EC2 Simulator**:
+
+   - Deploys an EC2 instance running Amazon Linux 2
+   - Installs and configures a systemd service that generates HTTP traffic
+   - Creates a security group allowing SSH access and all outbound traffic
+
+4. **Network Traffic**:
+
+   - Generated by the EC2 simulator making HTTP requests to example.com
+   - Creates real network flows that will be captured by VPC Flow Logs
+   - Runs continuously to ensure consistent log generation
+
+5. **VPC Flow Logs**:
+
+   - Captures metadata about IP traffic going to and from network interfaces in the VPC
+   - Configured to capture all traffic (ACCEPT and REJECT)
+   - Uses Parquet format with hourly partitioning for efficient storage and querying
+
+6. **S3 Bucket**:
+
+   - Stores the VPC Flow Logs in a structured format
+   - Enables versioning for data protection
+   - Configures access policies for log delivery and ClickHouse access
+
+7. **ClickHouse Cloud Service**:
+
+   - Provisions a managed ClickHouse service in AWS
+   - Configures memory, replicas, and other service parameters
+   - Provides the IAM role ARN needed for cross-account access
+
+8. **IAM Policy**:
+
+   - Defines permissions for accessing the S3 bucket
+   - Allows listing bucket contents and retrieving objects
+   - Scoped specifically to the VPC Flow Logs bucket
+
+9. **IAM Role**:
+
+   - Creates a role that can be assumed by the ClickHouse service
+   - Attaches the S3 access policy to the role
+   - Initially created with a placeholder trust policy
+
+10. **Wait for IAM Propagation**:
+
+    - Introduces a deliberate delay (300 seconds)
+    - Ensures IAM changes have propagated through AWS's eventually consistent system
+    - Critical for ensuring the role is available when ClickPipe attempts to use it
+
+11. **Update Trust Policy**:
+
+    - Updates the IAM role's trust policy with the ClickHouse service's IAM role ARN
+    - Uses a local-exec provisioner to run AWS CLI commands
+    - Establishes the cross-account trust relationship
+
+12. **ClickPipe**:
+    - Creates a data pipeline from S3 to ClickHouse
+    - Configures source (S3 bucket) and destination (ClickHouse table)
+    - Uses the IAM role for authentication
+    - Sets up continuous ingestion of VPC Flow Logs
+
+### Why Wait Time and Update Policy?
+
+1. **Wait Time (time_sleep resource)**:
+
+   - IAM changes in AWS are eventually consistent and can take time to propagate
+   - Without this wait, the ClickPipe might attempt to use the IAM role before it's fully available
+   - The 300-second wait ensures that IAM changes have propagated throughout AWS's global infrastructure
+   - This prevents race conditions and "role not found" errors during deployment
+   - ClickPipes will check for data in the source location when it's being created and WILL FAIL, if no data is found.
+     - VPC Flow Logs takes about 3 to 5 mins to start landing data in the S3 bucket
+
+2. **Update Trust Policy (null_resource)**:
+   - The ClickHouse service provides its own IAM role ARN that needs to be trusted
+   - This ARN is only available after the ClickHouse service is created
+   - The trust policy update establishes a secure cross-account relationship
+   - Using local-exec allows for dynamic updates based on the ClickHouse service output
+   - This approach ensures proper security boundaries while enabling cross-account access
 
 ## Quick Start
 
@@ -45,10 +216,35 @@ export AWS_PROFILE=sa
 export AWS_CONFIG_FILE=$HOME/.aws/config
 ```
 
-4. Review and modify variables:
+4. Create a `terraform.tfvars` file with your configuration:
 
-- Copy `terraform.tfvars.example` to `terraform.tfvars` (if provided)
-- Adjust variables according to your needs
+```hcl
+# AWS Configuration
+aws_region = "ap-southeast-1"
+
+# ClickHouse Cloud credentials
+organization_id = "your-organization-id"
+token_key       = "your-token-key"
+token_secret    = "your-token-secret"
+service_password = "your-secure-password"
+
+# Deployment flags
+deploy_vpc = true
+deploy_s3 = true
+deploy_flow_logs = true
+deploy_simulator = true
+deploy_clickhouse = true
+deploy_clickpipe = true
+
+# S3 Bucket configuration
+s3_bucket_name = "your-globally-unique-bucket-name"
+s3_bucket_private = true
+
+# ClickHouse configuration
+clickhouse_service_name = "VPCFlowLogs"
+clickhouse_region = "ap-southeast-2"
+clickhouse_iam_role_name = "ClickHouseS3AccessRole"
+```
 
 5. Deploy the infrastructure:
 
@@ -57,78 +253,29 @@ terraform plan    # Review the changes
 terraform apply   # Apply the changes
 ```
 
-## Configuration Options
+## Querying VPC Flow Logs in ClickHouse
 
-The project supports various deployment scenarios through variables:
+Once the infrastructure is deployed, you can query your VPC Flow Logs using SQL:
 
-- `deploy_vpc`: Create a new VPC (true/false)
-- `deploy_s3`: Create a new S3 bucket (true/false)
-- `deploy_flow_logs`: Enable VPC Flow Logs (true/false)
-- `deploy_simulator`: Deploy EC2 traffic simulator (true/false)
+```sql
+-- Example: Top source IPs by traffic volume
+SELECT
+    srcaddr,
+    SUM(bytes) AS total_bytes,
+    COUNT(*) AS connection_count
+FROM vpc_flow_logs
+GROUP BY srcaddr
+ORDER BY total_bytes DESC
+LIMIT 10;
 
-## Components
-
-### VPC Flow Logs
-
-- Captures network traffic in your VPC
-- Configurable aggregation intervals
-- Logs stored in S3 bucket
-
-### S3 Bucket
-
-- Secure storage for VPC Flow Logs
-- Versioning enabled
-- Configurable public/private access
-
-### EC2 Traffic Simulator
-
-- Generates sample network traffic
-- Runs on Amazon Linux 2
-- Automatically sends HTTP requests to generate flow logs
-
-## Development
-
-### Making Changes
-
-1. Create a new branch:
-
-```bash
-git checkout -b feature/your-feature-name
+-- Example: Traffic by protocol
+SELECT
+    protocol,
+    SUM(bytes) AS total_bytes
+FROM vpc_flow_logs
+GROUP BY protocol
+ORDER BY total_bytes DESC;
 ```
-
-2. Make your changes to the Terraform configurations
-
-3. Test your changes:
-
-```bash
-terraform fmt     # Format the code
-terraform validate # Validate the configuration
-terraform plan    # Review changes
-```
-
-4. Commit your changes:
-
-```bash
-git add .
-git commit -m "Description of your changes"
-```
-
-### Best Practices
-
-- Always format your Terraform code using `terraform fmt`
-- Use meaningful variable names and descriptions
-- Add tags to resources for better organization
-- Keep sensitive information in variables and never commit them
-
-## Clickhouse Integration
-
-After setting up the infrastructure:
-
-1. Configure Clickhouse Cloud to read from the S3 bucket
-2. Set up the appropriate table schema for VPC Flow Logs
-3. Create a data pipeline to continuously ingest logs
-
-(Detailed Clickhouse integration steps to be added)
 
 ## Cleanup
 
@@ -138,6 +285,24 @@ To destroy the infrastructure:
 terraform destroy
 ```
 
+## Notes
+
+- The project uses a single Terraform configuration file (main.tf) for all resources except the EC2 simulator
+- All outputs are defined in the outputs.tf file
+- The ClickPipe resource depends on the ClickHouse service and IAM role, which is managed through dependencies
+- The IAM role trust policy is updated using a local-exec provisioner to ensure proper permissions
+
+## Troubleshooting
+
+If you encounter issues with the ClickPipe not being able to access the S3 bucket:
+
+1. Verify that the IAM role has the correct trust policy
+2. Check that the S3 bucket policy allows access from the ClickHouse service
+3. Ensure that the ClickHouse service has the correct IAM role ARN
+4. Wait for IAM propagation & S3 bucket to have some data (can take up to 5 minutes)
+
+For more detailed troubleshooting, check the AWS CloudTrail logs and ClickHouse Cloud logs.
+
 ## Contributing
 
 1. Fork the repository
@@ -146,18 +311,13 @@ terraform destroy
 4. Push to the branch
 5. Create a Pull Request
 
-## Security Considerations
-
-- The EC2 simulator allows SSH access from any IP (0.0.0.0/0) - modify for production
-- S3 bucket public access is configurable - ensure appropriate settings for your use case
-- Review and adjust IAM permissions as needed
-
 ## Support
 
 Create a new issue in the repository!
 
 ## To Do
 
-- [ ] Add Clickhouse Integration Steps
+- [x] Add Clickhouse Integration Steps
 - [ ] Add Grafana Dashboard
-- [ ] Clean up the Terraform code
+- [x] Clean up the Terraform code
+- [ ] Check through the security setup

@@ -1,8 +1,8 @@
 // main.tf
 // ---------------------------------------------------------------------
 // Provider configuration and resource definitions.
-// This file instantiates the VPC, S3 bucket, and VPC Flow Logs resources
-// based on the boolean flags defined in variables.tf.
+// This file instantiates the VPC, S3 bucket, VPC Flow Logs resources,
+// ClickHouse service, and ClickPipe for data ingestion.
 // ---------------------------------------------------------------------
 
 terraform {
@@ -11,12 +11,26 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    clickhouse = {
+      source  = "ClickHouse/clickhouse"
+      version = "2.2.0-alpha2"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9.0"
+    }
   }
 }
 
 provider "aws" {
-  region = var.aws_region
+  region  = var.aws_region
   profile = "sa"
+}
+
+provider "clickhouse" {
+  organization_id = var.organization_id
+  token_key       = var.token_key
+  token_secret    = var.token_secret
 }
 
 ###############################
@@ -26,9 +40,9 @@ provider "aws" {
 // If false, the user must supply an existing VPC ID via var.vpc_id.
 ###############################
 resource "aws_vpc" "main" {
-  count              = var.deploy_vpc ? 1 : 0
-  cidr_block         = var.vpc_cidr
-  enable_dns_support = true
+  count                = var.deploy_vpc ? 1 : 0
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = {
@@ -45,7 +59,7 @@ resource "aws_vpc" "main" {
 resource "aws_s3_bucket" "flow_logs" {
   count         = var.deploy_s3 ? 1 : 0
   bucket        = var.s3_bucket_name
-  force_destroy = true  # This deletes all objects in the bucket when the bucket is destroyed, use for dev and testing only
+  force_destroy = true # This deletes all objects in the bucket when the bucket is destroyed, use for dev and testing only
 
   tags = {
     Name = "apac-sa-demo"
@@ -56,7 +70,7 @@ resource "aws_s3_bucket" "flow_logs" {
 resource "aws_s3_bucket_versioning" "flow_logs" {
   count  = var.deploy_s3 ? 1 : 0
   bucket = aws_s3_bucket.flow_logs[0].id
-  
+
   versioning_configuration {
     status = "Enabled"
   }
@@ -75,7 +89,7 @@ resource "aws_s3_bucket_public_access_block" "bucket_access" {
 
 # Add bucket policy for VPC Flow Logs and optional public access
 resource "aws_s3_bucket_policy" "bucket_policy" {
-  count  = var.deploy_s3 ? 1 : 0  # Always create policy for Flow Logs
+  count  = var.deploy_s3 ? 1 : 0 # Always create policy for Flow Logs
   bucket = aws_s3_bucket.flow_logs[0].id
 
   # Ensure the public access block settings are applied first
@@ -107,19 +121,56 @@ resource "aws_s3_bucket_policy" "bucket_policy" {
         Action   = ["s3:GetBucketAcl"]
         Resource = [aws_s3_bucket.flow_logs[0].arn]
       }
-    ],
-    # Add public read policy only if bucket is public
-    var.s3_bucket_private ? [] : [
-      {
-        Sid       = "PublicReadGetObject"
-        Effect    = "Allow"
-        Principal = "*"
-        Action    = "s3:GetObject"
-        Resource  = "${aws_s3_bucket.flow_logs[0].arn}/*"
-      }
+      ],
+      # Add public read policy only if bucket is public
+      var.s3_bucket_private ? [] : [
+        {
+          Sid       = "PublicReadGetObject"
+          Effect    = "Allow"
+          Principal = "*"
+          Action    = "s3:GetObject"
+          Resource  = "${aws_s3_bucket.flow_logs[0].arn}/*"
+        }
     ])
   })
 }
+
+###############################
+// Sample VPC Flow Log File
+// ---------------------------------------------------------------------
+// Creates and uploads a sample VPC flow log file to the S3 bucket
+// to ensure the ClickPipe has data to process.
+###############################
+# resource "null_resource" "sample_flow_log" {
+#   count = var.deploy_s3 ? 1 : 0
+
+#   triggers = {
+#     bucket_id = aws_s3_bucket.flow_logs[0].id
+#   }
+
+#   provisioner "local-exec" {
+#     command = <<-EOT
+#       # Create a temporary directory
+#       TEMP_DIR=$(mktemp -d)
+
+#       # Create a sample VPC flow log file
+#       cat > $TEMP_DIR/sample-flow-log.log << 'EOF'
+# version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+# EOF
+
+#       # Compress the file with gzip
+#       gzip $TEMP_DIR/sample-flow-log.log
+
+#       # Upload the compressed file to S3
+#       aws s3 cp $TEMP_DIR/sample-flow-log.log.gz s3://${aws_s3_bucket.flow_logs[0].bucket}/AWSLogs/sample-flow-log.log.gz
+
+#       # Clean up
+#       rm -rf $TEMP_DIR
+#     EOT
+#   }
+
+#   depends_on = [aws_s3_bucket_policy.bucket_policy]
+# }
 
 ###############################
 // VPC Flow Logs Resource
@@ -134,12 +185,243 @@ resource "aws_flow_log" "vpc_flow_logs" {
   vpc_id = var.deploy_vpc ? aws_vpc.main[0].id : var.vpc_id
 
   // Use new S3 bucket ARN if deployed, otherwise use provided ARN
-  log_destination      = var.deploy_s3 ? aws_s3_bucket.flow_logs[0].arn : var.s3_bucket_arn
-  log_destination_type = "s3"
-  traffic_type         = var.flow_logs_traffic_type
-#   log_format           = var.flow_logs_log_format
+  log_destination          = var.deploy_s3 ? aws_s3_bucket.flow_logs[0].arn : var.s3_bucket_arn
+  log_destination_type     = "s3"
+  traffic_type             = var.flow_logs_traffic_type
   max_aggregation_interval = var.max_aggregation_interval
+  destination_options {
+    file_format        = "parquet"
+    per_hour_partition = true
+  }
+
   tags = {
     Name = "apac-sa-demo-flow-logs"
   }
 }
+
+###############################
+// ClickHouse Resources
+// ---------------------------------------------------------------------
+// Creates a ClickHouse service for ingesting VPC Flow Logs
+###############################
+resource "clickhouse_service" "service" {
+  count                 = var.deploy_clickhouse ? 1 : 0
+  name                  = var.clickhouse_service_name
+  cloud_provider        = "aws"
+  region                = var.clickhouse_region
+  idle_scaling          = false # Set to false to keep the service running
+  ip_access             = var.clickhouse_ip_access
+  num_replicas          = var.clickhouse_num_replicas
+  min_replica_memory_gb = var.clickhouse_min_memory
+  max_replica_memory_gb = var.clickhouse_max_memory
+  idle_timeout_minutes  = null # Must be null when idle_scaling is disabled
+  password              = var.service_password
+}
+
+###############################
+// IAM Resources for ClickHouse
+// ---------------------------------------------------------------------
+// Creates IAM policy and role for ClickHouse to access S3 bucket
+###############################
+# Define locals for IAM role
+locals {
+  # Get the IAM role from the ClickHouse service when it's deployed
+  clickhouse_iam_role = var.deploy_clickhouse ? clickhouse_service.service[0].iam_role : null
+}
+
+# IAM policy for ClickHouse to access S3
+resource "aws_iam_policy" "clickhouse_s3_access" {
+  name        = "ClickHouseS3AccessPolicy"
+  description = "Policy allowing ClickHouse to access VPC flow logs in S3"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action   = ["s3:GetBucketLocation", "s3:ListBucket"],
+        Resource = ["arn:aws:s3:::${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}"],
+        Effect   = "Allow"
+      },
+      {
+        Action   = ["s3:Get*", "s3:List*"],
+        Resource = ["arn:aws:s3:::${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}/*"],
+        Effect   = "Allow"
+      }
+    ]
+  })
+  depends_on = [aws_s3_bucket.flow_logs]
+}
+
+# IAM role that can be assumed by ClickHouse
+resource "aws_iam_role" "clickhouse_role" {
+  count = var.deploy_clickhouse ? 1 : 0
+  name  = var.clickhouse_iam_role_name
+
+  # Start with a generic trust policy that will be updated later
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          AWS = "*"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+  depends_on = [aws_iam_policy.clickhouse_s3_access]
+}
+
+# Attach the S3 access policy to the role
+resource "aws_iam_role_policy_attachment" "clickhouse_s3_access" {
+  count      = length(aws_iam_role.clickhouse_role) > 0 ? 1 : 0
+  role       = aws_iam_role.clickhouse_role[0].name
+  policy_arn = aws_iam_policy.clickhouse_s3_access.arn
+  depends_on = [aws_iam_role.clickhouse_role]
+}
+
+# Add a time delay resource to wait for IAM propagation
+resource "time_sleep" "wait_for_iam_propagation" {
+  count = var.deploy_clickhouse ? 1 : 0
+
+  depends_on      = [aws_iam_role_policy_attachment.clickhouse_s3_access, null_resource.update_trust_policy]
+  create_duration = "300s" #Need to adjust and test this, for now 5mins is working well
+}
+
+# Use a null_resource with local-exec to update the trust policy
+resource "null_resource" "update_trust_policy" {
+  count = var.deploy_clickhouse ? 1 : 0
+
+  triggers = {
+    clickhouse_iam_role = clickhouse_service.service[0].iam_role
+    role_name           = aws_iam_role.clickhouse_role[0].name
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws iam update-assume-role-policy \
+        --role-name ${aws_iam_role.clickhouse_role[0].name} \
+        --policy-document '{
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "${clickhouse_service.service[0].iam_role}"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }'
+    EOT
+  }
+
+  depends_on = [clickhouse_service.service, aws_iam_role.clickhouse_role]
+}
+
+###############################
+// ClickPipe Resource
+// ---------------------------------------------------------------------
+// Creates a ClickPipe for ingesting VPC Flow Logs from S3 to ClickHouse
+###############################
+resource "clickhouse_clickpipe" "vpc_flow_logs" {
+  count       = var.deploy_clickhouse && var.deploy_clickpipe ? 1 : 0
+  name        = "VPC Flow Logs Pipeline"
+  description = "Data pipeline from S3 VPC Flow Logs to ClickHouse"
+
+  service_id = clickhouse_service.service[0].id
+  state      = "Running"
+
+  source = {
+    object_storage = {
+      type   = "s3"
+      format = var.clickpipe_format
+      url    = "s3://${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}/**"
+      # compression = "gzip" # Leaving this here for now
+      # delimiter      = " " # Leaving this here for now
+      authentication = "IAM_ROLE"
+      iam_role       = aws_iam_role.clickhouse_role[0].arn
+      is_continuous  = var.clickpipe_is_continuous
+    }
+  }
+
+  destination = {
+    table         = var.clickpipe_table_name
+    managed_table = true
+
+    table_definition = {
+      engine = {
+        type = "MergeTree"
+      }
+    }
+
+    columns = var.clickpipe_columns
+  }
+
+  depends_on = [time_sleep.wait_for_iam_propagation]
+}
+
+###############################
+// Outputs
+// ---------------------------------------------------------------------
+// Output values for reference
+###############################
+# VPC and S3 outputs
+# output "vpc_id" {
+#   description = "The VPC ID (either newly created or provided)"
+#   value       = var.deploy_vpc ? aws_vpc.main[0].id : var.vpc_id
+# }
+
+# output "s3_bucket_name" {
+#   description = "The name of the S3 bucket"
+#   value       = var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name
+# }
+
+# output "s3_bucket_arn" {
+#   description = "The ARN of the S3 bucket for flow logs"
+#   value       = var.deploy_s3 ? aws_s3_bucket.flow_logs[0].arn : var.s3_bucket_arn
+# }
+# output "flow_log_id" {
+#   description = "The ID of the VPC Flow Log"
+#   value       = var.deploy_flow_logs ? aws_flow_log.vpc_flow_logs[0].id : "Not created"
+# }
+
+# # ClickHouse outputs
+# output "clickhouse_service_id" {
+#   description = "The ID of the ClickHouse service"
+#   value       = var.deploy_clickhouse ? clickhouse_service.service[0].id : "Not deployed"
+# }
+
+# output "clickhouse_hostname" {
+#   description = "The hostname of the ClickHouse service"
+#   value       = var.deploy_clickhouse ? clickhouse_service.service[0].endpoints[0].host : "Not deployed"
+# }
+
+# output "clickhouse_service_iam_role" {
+#   description = "The IAM role ARN from ClickHouse service"
+#   value       = var.deploy_clickhouse ? clickhouse_service.service[0].iam_role : null
+# }
+
+# # IAM outputs
+# output "clickhouse_s3_access_role_arn" {
+#   description = "The ARN of the IAM role for ClickHouse to access S3"
+#   value       = length(aws_iam_role.clickhouse_role) > 0 ? aws_iam_role.clickhouse_role[0].arn : null
+# }
+
+# # ClickPipe outputs
+# output "clickpipe_id" {
+#   description = "The ID of the ClickPipe"
+#   value       = length(clickhouse_clickpipe.vpc_flow_logs) > 0 ? clickhouse_clickpipe.vpc_flow_logs[0].id : null
+# }
+
+# output "clickpipe_status" {
+#   description = "The status of the ClickPipe"
+#   value       = length(clickhouse_clickpipe.vpc_flow_logs) > 0 ? clickhouse_clickpipe.vpc_flow_logs[0].state : null
+# }
+
+# # Sample log file output
+# output "sample_log_file_path" {
+#   description = "The S3 path to the sample VPC flow log file"
+#   value       = var.deploy_s3 ? "s3://${aws_s3_bucket.flow_logs[0].bucket}/AWSLogs/sample-flow-log.log.gz" : null
+# }
