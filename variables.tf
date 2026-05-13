@@ -1,7 +1,9 @@
 // variables.tf
 // ---------------------------------------------------------------------
-// This file declares all variables used in the project.
-// Values should be provided via terraform.tfvars or secret.tfvars
+// Variable declarations for both pipelines:
+//   - Batch pipeline (VPC Flow Logs -> S3 -> ClickPipe)
+//   - Streaming pipeline (CloudWatch Logs -> Lambda -> Kinesis -> ClickPipe)
+// Values should be provided via terraform.tfvars or secret.tfvars.
 // ---------------------------------------------------------------------
 
 // AWS Configuration
@@ -37,8 +39,33 @@ variable "deploy_clickhouse" {
 }
 
 variable "deploy_clickpipe" {
-  description = "Flag to deploy ClickHouse ClickPipe for VPC Flow Logs"
+  description = "Flag to deploy ClickHouse S3 ClickPipe for VPC Flow Logs (batch pipeline)"
   type        = bool
+}
+
+// Streaming pipeline flags
+variable "deploy_cloudwatch_logs" {
+  description = "Flag to deploy the CloudWatch Logs group used by the streaming pipeline"
+  type        = bool
+  default     = false
+}
+
+variable "deploy_kinesis_stream" {
+  description = "Flag to deploy the Kinesis Data Stream used by the streaming pipeline"
+  type        = bool
+  default     = false
+}
+
+variable "deploy_lambda_transformer" {
+  description = "Flag to deploy the Lambda function that decompresses CloudWatch Logs subscription events and forwards them to Kinesis"
+  type        = bool
+  default     = false
+}
+
+variable "deploy_cloudwatch_clickpipe" {
+  description = "Flag to deploy the Kinesis ClickPipe that ingests transformed CloudWatch Logs events into ClickHouse (streaming pipeline)"
+  type        = bool
+  default     = false
 }
 
 // VPC Configuration
@@ -115,11 +142,6 @@ variable "clickhouse_region" {
   type        = string
 }
 
-variable "clickhouse_tier" {
-  description = "Tier for the ClickHouse service"
-  type        = string
-}
-
 variable "clickhouse_ip_access" {
   description = "IP access configuration for ClickHouse service"
   type = list(object({
@@ -143,11 +165,6 @@ variable "clickhouse_max_memory" {
   type        = number
 }
 
-variable "clickhouse_idle_timeout" {
-  description = "Idle timeout in minutes for ClickHouse service"
-  type        = number
-}
-
 variable "service_password" {
   description = "Password for the ClickHouse service"
   type        = string
@@ -157,11 +174,6 @@ variable "service_password" {
 // ClickPipe Configuration
 variable "clickpipe_format" {
   description = "Format of the data in S3 for ClickPipe"
-  type        = string
-}
-
-variable "clickpipe_s3_url" {
-  description = "S3 URL for ClickPipe if not using the deployed S3 bucket"
   type        = string
 }
 
@@ -200,4 +212,118 @@ variable "clickhouse_s3_access_role_arn" {
   description = "The ARN of the IAM role for ClickHouse service to access S3"
   type        = string
   default     = ""
+}
+
+// ---------------------------------------------------------------------
+// Streaming pipeline configuration (CloudWatch Logs -> Kinesis -> ClickPipe)
+// ---------------------------------------------------------------------
+
+// CloudWatch Logs
+variable "cloudwatch_log_group_name" {
+  description = "Name of the CloudWatch Logs group that receives EC2 simulator logs"
+  type        = string
+  default     = "/apac-sa-demo/app"
+}
+
+variable "cloudwatch_log_retention_days" {
+  description = "Retention (in days) for the CloudWatch Logs group"
+  type        = number
+  default     = 7
+}
+
+variable "cloudwatch_subscription_filter_pattern" {
+  description = "Filter pattern for the CloudWatch Logs -> Lambda subscription. Empty string forwards all events."
+  type        = string
+  default     = ""
+}
+
+// Kinesis Data Stream
+variable "kinesis_stream_name" {
+  description = "Name of the Kinesis Data Stream that the Lambda forwards to and ClickPipe reads from"
+  type        = string
+  default     = "apac-sa-demo-log-stream"
+}
+
+variable "kinesis_stream_mode" {
+  description = "Kinesis capacity mode: ON_DEMAND (recommended for demos) or PROVISIONED"
+  type        = string
+  default     = "ON_DEMAND"
+
+  validation {
+    condition     = contains(["ON_DEMAND", "PROVISIONED"], var.kinesis_stream_mode)
+    error_message = "kinesis_stream_mode must be ON_DEMAND or PROVISIONED."
+  }
+}
+
+variable "kinesis_shard_count" {
+  description = "Shard count for the Kinesis Data Stream (only used when stream_mode is PROVISIONED)"
+  type        = number
+  default     = 1
+}
+
+variable "kinesis_retention_hours" {
+  description = "Retention (in hours) for records on the Kinesis Data Stream. AWS minimum is 24."
+  type        = number
+  default     = 24
+}
+
+// Lambda transformer
+variable "lambda_function_name" {
+  description = "Name of the Lambda function that transforms CloudWatch Logs subscription events"
+  type        = string
+  default     = "apac-sa-demo-cw-to-kinesis"
+}
+
+variable "lambda_iam_role_name" {
+  description = "Name of the IAM role assumed by the Lambda transformer"
+  type        = string
+  default     = "apac-sa-demo-cw-to-kinesis-role"
+}
+
+// ClickHouse Kinesis IAM role
+variable "clickhouse_kinesis_iam_role_name" {
+  description = "Name of the IAM role that the Kinesis ClickPipe assumes. Use the ClickHouseAccess- naming convention to match the existing S3 role."
+  type        = string
+  default     = "ClickHouseAccess-ClickPipe-Kinesis-Demo"
+}
+
+// Kinesis ClickPipe configuration
+variable "cloudwatch_clickpipe_format" {
+  description = "Wire format on the Kinesis stream. JSONEachRow matches what the Lambda transformer emits."
+  type        = string
+  default     = "JSONEachRow"
+}
+
+variable "cloudwatch_clickpipe_iterator_type" {
+  description = "Kinesis iterator type: LATEST (recommended for streaming demos), TRIM_HORIZON, or AT_TIMESTAMP"
+  type        = string
+  default     = "LATEST"
+}
+
+variable "cloudwatch_clickpipe_use_enhanced_fan_out" {
+  description = "Use a Kinesis enhanced fan-out consumer for dedicated throughput per shard"
+  type        = bool
+  default     = false
+}
+
+variable "cloudwatch_clickpipe_table_name" {
+  description = "Destination table name for the streaming CloudWatch Logs pipeline"
+  type        = string
+  default     = "cloudwatch_logs"
+}
+
+variable "cloudwatch_clickpipe_columns" {
+  description = "Column definitions for the cloudwatch_logs destination table. Must match the JSON keys emitted by lambda/cw_to_kinesis.py."
+  type = list(object({
+    name = string
+    type = string
+  }))
+  default = [
+    { name = "log_group", type = "String" },
+    { name = "log_stream", type = "String" },
+    { name = "owner", type = "String" },
+    { name = "timestamp", type = "UInt64" },
+    { name = "id", type = "String" },
+    { name = "message", type = "String" },
+  ]
 }

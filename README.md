@@ -1,323 +1,363 @@
-# VPC Flow Logs to ClickHouse Cloud
+# AWS Logs to ClickHouse Cloud — Batch + Streaming Demo
 
-This project demonstrates how to export AWS VPC Flow Logs to S3 and subsequently ingest them into ClickHouse Cloud. It includes Terraform configurations to set up the necessary AWS infrastructure and a traffic simulator for testing purposes.
+This project demonstrates two end-to-end log ingestion patterns into ClickHouse Cloud:
+
+1. **Batch pipeline** — VPC Flow Logs land in S3 as Parquet, and an S3 ClickPipe continuously polls and ingests them into the `vpc_flow_logs` table.
+2. **Streaming pipeline** — Application logs from an EC2 simulator flow to CloudWatch Logs, a subscription filter triggers a Lambda transformer that decompresses the CloudWatch envelope and PutRecords each event onto a Kinesis Data Stream, and a Kinesis ClickPipe ingests records in real time into the `cloudwatch_logs` table.
+
+Both pipelines share a single ClickHouse Cloud service and the same EC2 simulator. Each pipeline can be enabled or disabled independently via deployment flags.
 
 ## Prerequisites
 
-- AWS CLI installed and configured with appropriate credentials
+- AWS CLI installed and configured (used for provider authentication; no IAM trust policies are written via the CLI — all IAM is managed declaratively by Terraform)
 - Terraform v1.10.0 or later
-- An AWS account with appropriate permissions
-- A ClickHouse Cloud account (for log ingestion)
-- ClickHouse Cloud API credentials (organization ID, token key, and token secret)
+- An AWS account with permissions to manage VPC, EC2, S3, IAM, CloudWatch Logs, Kinesis, and Lambda
+- A ClickHouse Cloud account and API credentials (organization ID, token key, token secret)
+
+## AWS Profile Configuration
+
+By default, `main.tf` uses `profile = "sa"`. If you want to use a different profile name, edit the `provider "aws"` block in `main.tf` and change the `profile` value.
+
+```hcl
+provider "aws" {
+  region  = var.aws_region
+  profile = "your-profile-name"  # change "sa" to your AWS CLI/SSO profile
+}
+```
+
+Alternatively, omit `profile` entirely and rely on the `AWS_PROFILE` environment variable or default credential chain:
+
+```hcl
+provider "aws" {
+  region = var.aws_region
+}
+```
+
+```bash
+export AWS_PROFILE=your-profile-name
+terraform plan -var-file=terraform.tfvars -var-file=secret.tfvars
+```
 
 ## Repository Structure
 
 ```
 .
-├── main.tf                   # Main Terraform configuration for all resources
-├── ec2_log_simulator.tf      # EC2 instance for traffic simulation
-├── variables.tf              # Variable definitions
-├── outputs.tf                # Output definitions
-├── terraform.tfvars.example  # Example variable values
-├── secret.tfvars.example     # Example for sensitive variables
-└── .gitignore                # Git ignore file
+├── main.tf                              # Shared resources: providers, VPC, S3, Flow Logs,
+│                                          ClickHouse service, IAM for S3 ClickPipe, S3 ClickPipe
+├── cloudwatch_logs.tf                   # Streaming pipeline: CW Logs, Kinesis stream, Lambda,
+│                                          IAM for Kinesis ClickPipe, Kinesis ClickPipe
+├── ec2_log_simulator.tf                 # Subnet, IGW, SG, EC2 simulator, simulator IAM profile
+├── ec2_simulator_user_data.sh.tftpl     # User-data template (traffic gen + awslogs config)
+├── lambda/
+│   └── cw_to_kinesis.py                 # Lambda that decompresses CW envelopes -> Kinesis
+├── variables.tf                         # Variable declarations for both pipelines
+├── outputs.tf                           # Output declarations for both pipelines
+├── terraform.tfvars.example             # Example values for all non-sensitive variables
+├── secret.tfvars.example                # Example values for sensitive variables
+├── docs/
+│   └── iam-trust.md                     # IAM trust reference: flows, permission tables, drift
+└── .gitignore
 ```
 
-## Components
+## Provider Versions
 
-### 1. VPC and Networking (main.tf, ec2_log_simulator.tf)
+| Provider                  | Version   | Notes                                                |
+| ------------------------- | --------- | ---------------------------------------------------- |
+| `hashicorp/aws`           | `~> 5.0`  |                                                      |
+| `ClickHouse/clickhouse`   | `~> 3.14` | v3.14 is the GA release for ClickPipes via Terraform |
+| `hashicorp/time`          | `~> 0.9`  | Used for IAM propagation delays                      |
+| `hashicorp/archive`       | `~> 2.4`  | Used to zip the Lambda transformer                   |
 
-- Creates a new VPC with public subnet
-- Sets up Internet Gateway and route tables
-- Configurable via deployment flags
+**Breaking changes vs. the previous `2.2.0-alpha2` pin**:
+- `clickhouse_clickpipe.description` was removed (top-level `description` attribute no longer exists).
+- `clickhouse_clickpipe.state` is now read-only; use `stopped = true` to pause a pipe (default is running).
+- `clickhouse_service.endpoints` is now an object (`endpoints.https.host`), not a list (`endpoints[0].host`).
 
-### 2. S3 Bucket (main.tf)
+## Architecture
 
-- Secure storage for VPC Flow Logs
-- Versioning enabled
-- Configurable public/private access
-- Bucket policies for log delivery
-
-### 3. VPC Flow Logs (main.tf)
-
-- Captures network traffic in your VPC
-- Configurable aggregation intervals
-- Logs stored in S3 bucket in Parquet format
-- Hourly partitioning enabled
-
-### 4. EC2 Traffic Simulator (ec2_log_simulator.tf)
-
-- Generates sample network traffic
-- Runs on Amazon Linux 2
-- Automatically sends HTTP requests to generate flow logs
-- Deployed as a systemd service
-
-### 5. ClickHouse Cloud Integration (main.tf)
-
-- Automatically provisions a ClickHouse Cloud service
-- Creates a ClickPipe to ingest VPC Flow Logs from S3
-- Configurable service tier and resources
-- Supports idle scaling to optimize costs
-
-### 6. IAM Integration (main.tf)
-
-- Creates IAM policy for S3 access
-- Sets up IAM role for ClickHouse to assume
-- Establishes trust relationship between AWS and ClickHouse
-
-## Execution Flow and Component Interdependencies
+### Batch pipeline — VPC Flow Logs
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│  VPC Creation   │────▶│  Subnet, IGW,   │────▶│  EC2 Simulator  │
-│                 │     │  Route Tables   │     │                 │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-                                                         │
-                                                         │ Generates Traffic
-                                                         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│   S3 Bucket     │◀────│  VPC Flow Logs  │◀────│  Network Traffic│
-│                 │     │                 │     │                 │
-└────────┬────────┘     └─────────────────┘     └─────────────────┘
-         │
-         │ Stores Logs
-         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│ ClickHouse Cloud│────▶│   IAM Policy    │────▶│    IAM Role     │
-│    Service      │     │                 │     │                 │
-└────────┬────────┘     └─────────────────┘     └────────┬────────┘
-         │                                                │
-         │                                                │
-         ▼                                                ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│                 │     │                 │     │                 │
-│  Wait for IAM   │────▶│  Update Trust   │────▶│   ClickPipe     │
-│  Propagation    │     │     Policy      │     │                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+┌──────────────┐    ┌─────────────────┐    ┌──────────────┐
+│ EC2 Simulator│───►│ VPC Flow Logs   │───►│ S3 (Parquet, │
+│ (HTTP traffic│    │ (all traffic,   │    │  hourly parts)│
+│  to example) │    │  ACCEPT+REJECT) │    │              │
+└──────────────┘    └─────────────────┘    └───────┬──────┘
+                                                   │
+                                                   ▼
+                                           ┌──────────────┐
+                                           │ S3 ClickPipe │
+                                           │ (IAM_ROLE)   │
+                                           └───────┬──────┘
+                                                   │
+                                                   ▼
+                                           ┌──────────────┐
+                                           │ ClickHouse   │
+                                           │ Cloud        │
+                                           │ (vpc_flow_   │
+                                           │  logs table) │
+                                           └──────────────┘
 ```
 
-### Component Explanations
+### Streaming pipeline — CloudWatch Logs
 
-1. **VPC Creation**:
+```
+┌──────────────┐    ┌─────────────────┐    ┌────────────────┐
+│ EC2 Simulator│───►│ /var/log/app/   │───►│ CloudWatch Logs│
+│ (JSON log    │    │ app.log         │    │ group          │
+│  writer)     │    │ (awslogs agent) │    │                │
+└──────────────┘    └─────────────────┘    └────────┬───────┘
+                                                    │ subscription filter
+                                                    ▼
+                                           ┌────────────────┐
+                                           │ Lambda         │
+                                           │ cw_to_kinesis  │
+                                           │ (gunzip, fan   │
+                                           │  out events)   │
+                                           └────────┬───────┘
+                                                    │ PutRecords
+                                                    ▼
+                                           ┌────────────────┐
+                                           │ Kinesis Data   │
+                                           │ Stream         │
+                                           └────────┬───────┘
+                                                    │
+                                                    ▼
+                                           ┌────────────────┐
+                                           │ Kinesis        │
+                                           │ ClickPipe      │
+                                           │ (IAM_ROLE)     │
+                                           └────────┬───────┘
+                                                    │
+                                                    ▼
+                                           ┌────────────────┐
+                                           │ ClickHouse     │
+                                           │ Cloud          │
+                                           │ (cloudwatch_   │
+                                           │  logs table)   │
+                                           └────────────────┘
+```
 
-   - Creates a new VPC with CIDR block specified in variables
-   - Enables DNS support and hostnames
-   - Serves as the foundation for all networking resources
+### Why the Lambda transformer
 
-2. **Subnet, IGW, Route Tables**:
+CloudWatch Logs subscription filters always emit **gzip-compressed payloads** that wrap N log events in a single JSON envelope:
 
-   - Creates a public subnet within the VPC
-   - Sets up an Internet Gateway for external connectivity
-   - Configures route tables to allow traffic flow
+```json
+{
+  "messageType": "DATA_MESSAGE",
+  "owner": "<account-id>",
+  "logGroup": "/apac-sa-demo/app",
+  "logStream": "<instance-id>",
+  "subscriptionFilters": ["cw-to-lambda-transformer"],
+  "logEvents": [
+    { "id": "...", "timestamp": 1715000000000, "message": "..." },
+    ...
+  ]
+}
+```
 
-3. **EC2 Simulator**:
+ClickPipe's Kinesis source expects clean `JSONEachRow` records. The Lambda (`lambda/cw_to_kinesis.py`) sits between the subscription filter and the Kinesis stream:
 
-   - Deploys an EC2 instance running Amazon Linux 2
-   - Installs and configures a systemd service that generates HTTP traffic
-   - Creates a security group allowing SSH access and all outbound traffic
+1. Receives the subscription event from CloudWatch Logs.
+2. Base64-decodes and gunzips the payload.
+3. Skips `CONTROL_MESSAGE` (CloudWatch health-check pings).
+4. Flattens each `logEvent` into a single JSON line and writes it to Kinesis via `PutRecords` (batched up to 500 records per call).
 
-4. **Network Traffic**:
+The records on the Kinesis stream therefore look like:
 
-   - Generated by the EC2 simulator making HTTP requests to example.com
-   - Creates real network flows that will be captured by VPC Flow Logs
-   - Runs continuously to ensure consistent log generation
+```json
+{"log_group":"...","log_stream":"...","owner":"...","timestamp":1715000000000,"id":"...","message":"<original log line>"}
+```
 
-5. **VPC Flow Logs**:
+…which ClickPipe ingests directly with `format = JSONEachRow` and no further decoding.
 
-   - Captures metadata about IP traffic going to and from network interfaces in the VPC
-   - Configured to capture all traffic (ACCEPT and REJECT)
-   - Uses Parquet format with hourly partitioning for efficient storage and querying
+## IAM Trust Configuration
 
-6. **S3 Bucket**:
+Cross-account IAM trust between AWS and ClickHouse Cloud is configured **entirely by Terraform**.
 
-   - Stores the VPC Flow Logs in a structured format
-   - Enables versioning for data protection
-   - Configures access policies for log delivery and ClickHouse access
-
-7. **ClickHouse Cloud Service**:
-
-   - Provisions a managed ClickHouse service in AWS
-   - Configures memory, replicas, and other service parameters
-   - Provides the IAM role ARN needed for cross-account access
-
-8. **IAM Policy**:
-
-   - Defines permissions for accessing the S3 bucket
-   - Allows listing bucket contents and retrieving objects
-   - Scoped specifically to the VPC Flow Logs bucket
-
-9. **IAM Role**:
-
-   - Creates a role that can be assumed by the ClickHouse service
-   - Attaches the S3 access policy to the role
-   - Initially created with a placeholder trust policy
-
-10. **Wait for IAM Propagation**:
-
-    - Introduces a deliberate delay (300 seconds)
-    - Ensures IAM changes have propagated through AWS's eventually consistent system
-    - Critical for ensuring the role is available when ClickPipe attempts to use it
-
-11. **Update Trust Policy**:
-
-    - Updates the IAM role's trust policy with the ClickHouse service's IAM role ARN
-    - Uses a local-exec provisioner to run AWS CLI commands
-    - Establishes the cross-account trust relationship
-
-12. **ClickPipe**:
-    - Creates a data pipeline from S3 to ClickHouse
-    - Configures source (S3 bucket) and destination (ClickHouse table)
-    - Uses the IAM role for authentication
-    - Sets up continuous ingestion of VPC Flow Logs
-
-### Why Wait Time and Update Policy?
-
-1. **Wait Time (time_sleep resource)**:
-
-   - IAM changes in AWS are eventually consistent and can take time to propagate
-   - Without this wait, the ClickPipe might attempt to use the IAM role before it's fully available
-   - The 300-second wait ensures that IAM changes have propagated throughout AWS's global infrastructure
-   - This prevents race conditions and "role not found" errors during deployment
-   - ClickPipes will check for data in the source location when it's being created and WILL FAIL, if no data is found.
-     - VPC Flow Logs takes about 3 to 5 mins to start landing data in the S3 bucket
-
-2. **Update Trust Policy (null_resource)**:
-   - The ClickHouse service provides its own IAM role ARN that needs to be trusted
-   - This ARN is only available after the ClickHouse service is created
-   - The trust policy update establishes a secure cross-account relationship
-   - Using local-exec allows for dynamic updates based on the ClickHouse service output
-   - This approach ensures proper security boundaries while enabling cross-account access
+For the full walkthrough — step-by-step flow, permission policy tables for both pipelines, naming convention, drift recovery, and design rationale — see [`docs/iam-trust.md`](docs/iam-trust.md).
 
 ## Quick Start
 
-1. Clone the repository:
+1. Clone and initialize:
+   ```bash
+   git clone https://github.com/ClickHouse/aws_vpc_logs_demo.git
+   cd aws_vpc_logs_demo
+   terraform init
+   ```
 
-```bash
-git clone https://github.com/ClickHouse/aws_vpc_logs_demo.git
-cd aws_vpc_logs_demo
-```
+2. Configure AWS credentials. The Terraform AWS provider in `main.tf` uses `profile = "sa"`. Choose one of these options:
 
-2. Initialize Terraform:
+   **Option A: AWS SSO (for users with SSO access)**
+   ```bash
+   aws configure sso
+   export AWS_PROFILE=sa
+   export AWS_CONFIG_FILE=$HOME/.aws/config
+   ```
 
-```bash
-terraform init
-```
+   **Option B: AWS Access Keys (for external partners without SSO)**
+   
+   Create an AWS IAM user with programmatic access if you don't have one. Then:
+   ```bash
+   aws configure --profile sa
+   # Interactively enter:
+   #   AWS Access Key ID: <your-access-key-id>
+   #   AWS Secret Access Key: <your-secret-access-key>
+   #   Default region: <same as your aws_region in terraform.tfvars>
+   #   Default output format: json
+   
+   export AWS_PROFILE=sa
+   export AWS_CONFIG_FILE=$HOME/.aws/config
+   ```
 
-3. Configure your AWS credentials:
+   **Option C: Environment variables (for CI/CD or automation)**
+   ```bash
+   export AWS_ACCESS_KEY_ID=<your-access-key-id>
+   export AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
+   export AWS_DEFAULT_REGION=<same as aws_region in terraform.tfvars>
+   # Skip AWS_PROFILE; Terraform will use env vars by default
+   ```
+   
+   > **IAM Permissions Note**: The deploying user/profile must have permissions for: VPC, EC2, S3, CloudWatch Logs, Kinesis, Lambda, IAM (creating roles and policies), and CloudFormation. Work with your AWS admin to scope a least-privilege policy if needed.
 
-```bash
-aws configure sso
-# make sure to set the profile to "sa" OR update the profile name in the main.tf file
-# Update the Bash Profile or Zsh Profile to set the AWS_PROFILE and AWS_CONFIG_FILE environment variables
-export AWS_PROFILE=sa
-export AWS_CONFIG_FILE=$HOME/.aws/config
-```
+3. Copy and edit the example variable files:
+   ```bash
+   cp terraform.tfvars.example terraform.tfvars
+   cp secret.tfvars.example secret.tfvars
+   # edit both — fill in AWS region, bucket name, ClickHouse org ID, token, etc.
+   ```
 
-4. Create a `terraform.tfvars` file with your configuration:
+   **`secret.tfvars` contents and where to obtain each value:**
 
-```hcl
-# AWS Configuration
-aws_region = "ap-southeast-1"
+   | Variable           | What it is                                              | Where to obtain                                                                                                                                                                                                       |
+   | ------------------ | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `organization_id`  | The UUID of your ClickHouse Cloud organization          | ClickHouse Cloud console → top-left org switcher → **Organization details**. Or any service URL contains it: `https://console.clickhouse.cloud/organizations/<org-id>/...`                                            |
+   | `token_key`        | The "Key ID" half of a ClickHouse Cloud API key pair    | ClickHouse Cloud console → **Settings** → **API keys** → **New API key**. Give it the `Admin` role (needed to provision services and ClickPipes). The Key ID is shown once on creation.                               |
+   | `token_secret`     | The "Secret" half of the API key pair                   | Shown only once at API key creation alongside the Key ID. Store it immediately — the console will not show it again. If you lose it, revoke the key and create a new pair.                                            |
+   | `service_password` | The password for the ClickHouse service's `default` user | Choose any strong value yourself; this Terraform applies it when provisioning the service. Use it to connect via `clickhouse-client`, JDBC, or the SQL console. Treat it as sensitive — never commit to git.          |
 
-# ClickHouse Cloud credentials
-organization_id = "your-organization-id"
-token_key       = "your-token-key"
-token_secret    = "your-token-secret"
-service_password = "your-secure-password"
+   Keep `secret.tfvars` out of version control (`.gitignore` already excludes `*.tfvars` except `*.tfvars.example`).
 
-# Deployment flags
-deploy_vpc = true
-deploy_s3 = true
-deploy_flow_logs = true
-deploy_simulator = true
-deploy_clickhouse = true
-deploy_clickpipe = true
+4. Deploy:
+   ```bash
+   terraform plan  -var-file=terraform.tfvars -var-file=secret.tfvars
+   terraform apply -var-file=terraform.tfvars -var-file=secret.tfvars
+   ```
 
-# S3 Bucket configuration
-s3_bucket_name = "your-globally-unique-bucket-name"
-s3_bucket_private = true
+5. Wait for both pipelines to start producing data:
+   - VPC Flow Logs take 3–5 minutes to land in S3 after the simulator starts.
+   - The streaming pipeline begins delivering events to ClickHouse within ~5–10 seconds of the simulator writing its first log line, once the 300s IAM propagation wait completes.
 
-# ClickHouse configuration
-clickhouse_service_name = "VPCFlowLogs"
-clickhouse_region = "ap-southeast-2"
-clickhouse_iam_role_name = "ClickHouseS3AccessRole"
-```
+## Querying
 
-5. Deploy the infrastructure:
-
-```bash
-terraform plan    # Review the changes
-terraform apply   # Apply the changes
-```
-
-## Querying VPC Flow Logs in ClickHouse
-
-Once the infrastructure is deployed, you can query your VPC Flow Logs using SQL:
+### Batch pipeline — `vpc_flow_logs`
 
 ```sql
--- Example: Top source IPs by traffic volume
-SELECT
-    srcaddr,
-    SUM(bytes) AS total_bytes,
-    COUNT(*) AS connection_count
+-- Top source IPs by traffic volume
+SELECT srcaddr, SUM(bytes) AS total_bytes, COUNT(*) AS connection_count
 FROM vpc_flow_logs
 GROUP BY srcaddr
 ORDER BY total_bytes DESC
 LIMIT 10;
 
--- Example: Traffic by protocol
-SELECT
-    protocol,
-    SUM(bytes) AS total_bytes
+-- Traffic by protocol
+SELECT protocol, SUM(bytes) AS total_bytes
 FROM vpc_flow_logs
 GROUP BY protocol
 ORDER BY total_bytes DESC;
 ```
 
-## Cleanup
+### Streaming pipeline — `cloudwatch_logs`
 
-To destroy the infrastructure:
+```sql
+-- Most recent application log events
+SELECT
+    fromUnixTimestamp64Milli(timestamp) AS ts,
+    log_stream,
+    message
+FROM cloudwatch_logs
+ORDER BY ts DESC
+LIMIT 20;
 
-```bash
-terraform destroy
+-- Parse the JSON message column into structured fields
+SELECT
+    fromUnixTimestamp64Milli(timestamp)        AS ts,
+    JSONExtractString(message, 'request_id')   AS request_id,
+    JSONExtractInt(message, 'http_code')       AS http_code,
+    JSONExtractInt(message, 'latency_ms')      AS latency_ms,
+    JSONExtractString(message, 'status')       AS status
+FROM cloudwatch_logs
+ORDER BY ts DESC
+LIMIT 20;
+
+-- p95 latency over the last 5 minutes
+SELECT quantile(0.95)(JSONExtractInt(message, 'latency_ms')) AS p95_ms
+FROM cloudwatch_logs
+WHERE fromUnixTimestamp64Milli(timestamp) > now() - INTERVAL 5 MINUTE;
 ```
 
-## Notes
+## Deployment Flags
 
-- The project uses a single Terraform configuration file (main.tf) for all resources except the EC2 simulator
-- All outputs are defined in the outputs.tf file
-- The ClickPipe resource depends on the ClickHouse service and IAM role, which is managed through dependencies
-- The IAM role trust policy is updated using a local-exec provisioner to ensure proper permissions
+| Flag                          | Default | Pipeline   | Purpose                                                       |
+| ----------------------------- | ------- | ---------- | ------------------------------------------------------------- |
+| `deploy_vpc`                  | `true`  | Shared     | Create new VPC vs. use existing                               |
+| `deploy_s3`                   | `true`  | Batch      | Create new S3 bucket for VPC Flow Logs vs. use existing       |
+| `deploy_flow_logs`            | `true`  | Batch      | Enable VPC Flow Logs capture                                  |
+| `deploy_simulator`            | `true`  | Shared     | Deploy the EC2 traffic generator                              |
+| `deploy_clickhouse`           | `true`  | Shared     | Provision the ClickHouse Cloud service                        |
+| `deploy_clickpipe`            | `true`  | Batch      | Create the S3 ClickPipe (`vpc_flow_logs` table)               |
+| `deploy_cloudwatch_logs`      | `false` | Streaming  | Create the CloudWatch Logs group & EC2 instance profile       |
+| `deploy_kinesis_stream`       | `false` | Streaming  | Create the Kinesis Data Stream                                |
+| `deploy_lambda_transformer`   | `false` | Streaming  | Create the Lambda + subscription filter                       |
+| `deploy_cloudwatch_clickpipe` | `false` | Streaming  | Create the Kinesis ClickPipe (`cloudwatch_logs` table)        |
+
+To enable the streaming pipeline end-to-end, set all four streaming flags to `true` (as shown in `terraform.tfvars.example`).
+
+## Cleanup
+
+```bash
+terraform destroy -var-file=terraform.tfvars -var-file=secret.tfvars
+```
 
 ## Troubleshooting
 
-If you encounter issues with the ClickPipe not being able to access the S3 bucket:
+### Batch pipeline (S3 ClickPipe)
 
-1. Verify that the IAM role has the correct trust policy
-2. Check that the S3 bucket policy allows access from the ClickHouse service
-3. Ensure that the ClickHouse service has the correct IAM role ARN
-4. Wait for IAM propagation & S3 bucket to have some data (can take up to 5 minutes)
+- ClickPipe state stuck in `Provisioning` or showing `AccessDenied`: verify the trust policy on `ClickHouseAccess-ClickPipe-S3-Demo` references the current `clickhouse_service.service.iam_role` ARN.
+- No data in `vpc_flow_logs`: VPC Flow Logs take 3–5 minutes to first land in S3; verify S3 bucket has Parquet objects under `AWSLogs/`.
 
-For more detailed troubleshooting, check the AWS CloudTrail logs and ClickHouse Cloud logs.
+### Streaming pipeline (Kinesis ClickPipe)
 
-## Contributing
+- **ClickPipe shows `Failed` / `AccessDenied`** — the trust policy on `ClickHouseAccess-ClickPipe-Kinesis-Demo` is the most likely cause. Run:
+  ```bash
+  aws iam get-role --role-name ClickHouseAccess-ClickPipe-Kinesis-Demo \
+    --query 'Role.AssumeRolePolicyDocument'
+  ```
+  The principal should equal the value of the `clickhouse_service_iam_role` output. If they differ, the ClickHouse service was likely recreated out-of-band — `terraform apply` will reconcile it because the AWS IAM role depends on `clickhouse_service.service[0].iam_role` and Terraform will detect the drift.
+- **CloudWatch Logs group is empty** — the EC2 simulator isn't shipping logs. SSH in and check `journalctl -u awslogsd` and `cat /var/log/app/app.log`. Verify the instance profile is attached (`aws ec2 describe-instances --instance-ids <id> --query 'Reservations[].Instances[].IamInstanceProfile'`).
+- **Log group has events but Kinesis stream is empty** — the Lambda isn't being invoked. Check CloudWatch metrics for the Lambda function (`Invocations`, `Errors`) and the Lambda's own log group `/aws/lambda/apac-sa-demo-cw-to-kinesis`.
+- **Kinesis stream has records but the ClickPipe table is empty** — the ClickPipe role can't read from the stream. Test by assuming the role manually:
+  ```bash
+  aws sts assume-role \
+    --role-arn $(terraform output -raw clickhouse_kinesis_role_arn) \
+    --role-session-name debug
+  ```
+  Then with the temporary credentials, run `aws kinesis describe-stream --stream-name apac-sa-demo-log-stream`.
 
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+### IAM propagation timing
 
-## Support
+If apply consistently fails on `clickhouse_clickpipe.cloudwatch_logs` with an IAM error, increase `time_sleep.wait_for_kinesis_iam_propagation.create_duration` (and the matching S3 one in `main.tf`) past 300 seconds. AWS does not document a deterministic upper bound for IAM propagation.
 
-Create a new issue in the repository!
+## Notes
+
+- The S3 ClickPipe and Kinesis ClickPipe share the same ClickHouse Cloud service but use **separate** customer-owned IAM roles. Don't combine them; keep the blast radius small per pipeline.
+- The Lambda transformer is intentionally minimal (~60 lines). Add a CloudWatch alarm on the function's `Errors` metric in production.
+- All IAM roles in this demo use a permission boundary of "minimum required actions only." If you reuse these in production, scope the resources further (e.g. by stream name pattern or log group prefix).
 
 ## To Do
 
-- [x] Add Clickhouse Integration Steps
-- [ ] Add Grafana Dashboard
+- [x] Add ClickHouse integration steps
+- [x] Add streaming pipeline via CloudWatch Logs + Kinesis
+- [ ] Add Grafana dashboard
 - [x] Clean up the Terraform code
-- [ ] Check through the security setup
+- [ ] Add CloudWatch alarms for Lambda errors and Kinesis throttling
