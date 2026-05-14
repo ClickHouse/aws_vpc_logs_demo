@@ -1,10 +1,15 @@
-// ec2.tf
+// ec2_log_simulator.tf
 // ---------------------------------------------------------------------
-// This file provisions additional resources to simulate traffic:
-//   - A public subnet (if creating a new VPC)
+// This file provisions resources to simulate workload activity:
+//   - A public subnet (when a new VPC is created)
 //   - A security group for the EC2 instance
-//   - An EC2 instance that continuously generates outbound HTTP traffic
-// This traffic will create VPC Flow Logs.
+//   - An IAM instance profile that lets the EC2 ship application logs
+//     to CloudWatch (only attached when deploy_cloudwatch_logs is true)
+//   - An EC2 instance that:
+//       * continuously generates outbound HTTP traffic (drives VPC Flow Logs)
+//       * writes structured JSON application logs to /var/log/app/app.log
+//       * runs the awslogs agent to forward /var/log/app/app.log to the
+//         demo CloudWatch Logs group (streaming pipeline source)
 // ---------------------------------------------------------------------
 
 // Create a public subnet if a new VPC is being deployed.
@@ -92,6 +97,61 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
+// ---------------------------------------------------------------------
+// IAM instance profile for the simulator
+//
+// Only created when the CloudWatch Logs pipeline is enabled. The role
+// allows the awslogs agent on the instance to push log events to the
+// demo log group.
+// ---------------------------------------------------------------------
+resource "aws_iam_role" "simulator" {
+  count = var.deploy_simulator && var.deploy_cloudwatch_logs ? 1 : 0
+  name  = "apac-sa-demo-simulator-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "simulator_cw_logs" {
+  count = var.deploy_simulator && var.deploy_cloudwatch_logs ? 1 : 0
+  name  = "SimulatorCloudWatchLogsPolicy"
+  role  = aws_iam_role.simulator[0].id
+
+  // logs:CreateLogGroup is required because the awslogs daemon calls it
+  // defensively on startup even when the group already exists; without
+  // it the publisher thread crashes with AccessDeniedException and never
+  // ships data. The group ARN (without `:*`) covers CreateLogGroup; the
+  // `:*` form scopes the stream-level actions.
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams",
+      ],
+      Resource = [
+        aws_cloudwatch_log_group.app_logs[0].arn,
+        "${aws_cloudwatch_log_group.app_logs[0].arn}:*",
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "simulator" {
+  count = var.deploy_simulator && var.deploy_cloudwatch_logs ? 1 : 0
+  name  = "apac-sa-demo-simulator-profile"
+  role  = aws_iam_role.simulator[0].name
+}
+
 // EC2 instance that simulates traffic by continuously sending HTTP requests.
 resource "aws_instance" "simulator" {
   count = var.deploy_simulator ? 1 : 0
@@ -105,71 +165,21 @@ resource "aws_instance" "simulator" {
   vpc_security_group_ids      = [aws_security_group.ec2_sg.id]
   associate_public_ip_address = true
 
-  // User data script to continuously generate outbound HTTP traffic.
-  user_data = <<-EOF
-    #!/bin/bash
-    
-    # Enable logging of user data script execution
-    exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-    
-    echo "[INFO] Starting user data script execution"
-    
-    # Update and install required packages
-    echo "[INFO] Updating system packages"
-    yum update -y
-    echo "[INFO] Installing curl"
-    yum install -y curl
-    
-    # Create a systemd service file
-    echo "[INFO] Creating traffic generator service"
-    cat <<'SERVICE' > /etc/systemd/system/traffic-generator.service
-[Unit]
-Description=Traffic Generator Service
-After=network.target
+  // Attach the CloudWatch-capable instance profile only when the
+  // streaming pipeline is enabled. Otherwise the instance runs without
+  // a profile, exactly as it did before this integration.
+  iam_instance_profile = var.deploy_cloudwatch_logs ? aws_iam_instance_profile.simulator[0].name : null
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/generate-traffic.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-    # Create the traffic generator script
-    echo "[INFO] Creating traffic generator script"
-    cat <<'SCRIPT' > /usr/local/bin/generate-traffic.sh
-#!/bin/bash
-
-# Set up logging
-exec 1> >(logger -s -t $(basename $0)) 2>&1
-
-echo "Traffic generator script started"
-
-while true; do
-    echo "Sending request to example.com"
-    if curl -s https://www.example.com > /dev/null; then
-        echo "Request successful"
-    else
-        echo "Request failed"
-    fi
-    sleep 5
-done
-SCRIPT
-
-    # Make the script executable
-    echo "[INFO] Setting permissions"
-    chmod +x /usr/local/bin/generate-traffic.sh
-    
-    # Start the service
-    echo "[INFO] Starting traffic generator service"
-    systemctl daemon-reload
-    systemctl enable traffic-generator
-    systemctl start traffic-generator
-    
-    echo "[INFO] User data script execution completed"
-  EOF
+  // User data script:
+  //   - generates outbound HTTP traffic (drives VPC Flow Logs, batch pipeline)
+  //   - writes structured JSON application logs to /var/log/app/app.log
+  //   - configures awslogs to ship those logs to CloudWatch Logs when
+  //     the streaming pipeline is enabled (passed in via templatefile)
+  user_data = templatefile("${path.module}/ec2_simulator_user_data.sh.tftpl", {
+    enable_cloudwatch_logs = var.deploy_cloudwatch_logs
+    cloudwatch_log_group   = var.deploy_cloudwatch_logs ? aws_cloudwatch_log_group.app_logs[0].name : ""
+    aws_region             = var.aws_region
+  })
 
   tags = {
     Name = "EC2-Simulator"

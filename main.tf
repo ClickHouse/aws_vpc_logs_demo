@@ -1,8 +1,12 @@
 // main.tf
 // ---------------------------------------------------------------------
-// Provider configuration and resource definitions.
-// This file instantiates the VPC, S3 bucket, VPC Flow Logs resources,
-// ClickHouse service, and ClickPipe for data ingestion.
+// Provider configuration and shared resources for the demo:
+//   - VPC, S3 bucket, VPC Flow Logs (batch pipeline: S3 -> ClickPipe -> ClickHouse)
+//   - ClickHouse Cloud service (shared by both pipelines)
+//   - S3 ClickPipe (VPC Flow Logs batch ingestion)
+//
+// The streaming pipeline (CloudWatch Logs -> Lambda -> Kinesis -> ClickPipe)
+// is defined in cloudwatch_logs.tf and reuses the ClickHouse service below.
 // ---------------------------------------------------------------------
 
 terraform {
@@ -13,14 +17,22 @@ terraform {
     }
     clickhouse = {
       source  = "ClickHouse/clickhouse"
-      version = "2.2.0-alpha2"
+      version = "~> 3.14"
     }
     time = {
       source  = "hashicorp/time"
       version = "~> 0.9.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
+
+// Used by cloudwatch_logs.tf to build ARNs and the CloudWatch Logs service principal.
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
 
 provider "aws" {
   region  = var.aws_region
@@ -252,25 +264,22 @@ resource "aws_iam_policy" "clickhouse_s3_access" {
   depends_on = [aws_s3_bucket.flow_logs]
 }
 
-# IAM role that can be assumed by ClickHouse
+# IAM role that ClickHouse Cloud assumes to read VPC Flow Logs from S3.
+# The trust policy is written inline using clickhouse_service.service[0].iam_role;
+# Terraform's dependency graph guarantees the ClickHouse service is provisioned
+# before this role is created, so the ARN is always known at create time.
 resource "aws_iam_role" "clickhouse_role" {
   count = var.deploy_clickhouse ? 1 : 0
   name  = var.clickhouse_iam_role_name
 
-  # Start with a generic trust policy that will be updated later
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Principal = {
-          AWS = "*"
-        },
-        Action = "sts:AssumeRole"
-      }
-    ]
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { AWS = clickhouse_service.service[0].iam_role },
+      Action    = "sts:AssumeRole"
+    }]
   })
-  depends_on = [aws_iam_policy.clickhouse_s3_access]
 }
 
 # Attach the S3 access policy to the role
@@ -278,68 +287,37 @@ resource "aws_iam_role_policy_attachment" "clickhouse_s3_access" {
   count      = length(aws_iam_role.clickhouse_role) > 0 ? 1 : 0
   role       = aws_iam_role.clickhouse_role[0].name
   policy_arn = aws_iam_policy.clickhouse_s3_access.arn
-  depends_on = [aws_iam_role.clickhouse_role]
 }
 
-# Add a time delay resource to wait for IAM propagation
+# IAM is eventually consistent across AWS's global infrastructure. Wait
+# before the ClickPipe attempts to assume the role.
 resource "time_sleep" "wait_for_iam_propagation" {
-  count = var.deploy_clickhouse ? 1 : 0
-
-  depends_on      = [aws_iam_role_policy_attachment.clickhouse_s3_access, null_resource.update_trust_policy]
-  create_duration = "300s" #Need to adjust and test this, for now 5mins is working well
-}
-
-# Use a null_resource with local-exec to update the trust policy
-resource "null_resource" "update_trust_policy" {
-  count = var.deploy_clickhouse ? 1 : 0
-
-  triggers = {
-    clickhouse_iam_role = clickhouse_service.service[0].iam_role
-    role_name           = aws_iam_role.clickhouse_role[0].name
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      aws iam update-assume-role-policy \
-        --role-name ${aws_iam_role.clickhouse_role[0].name} \
-        --policy-document '{
-          "Version": "2012-10-17",
-          "Statement": [
-            {
-              "Effect": "Allow",
-              "Principal": {
-                "AWS": "${clickhouse_service.service[0].iam_role}"
-              },
-              "Action": "sts:AssumeRole"
-            }
-          ]
-        }'
-    EOT
-  }
-
-  depends_on = [clickhouse_service.service, aws_iam_role.clickhouse_role]
+  count           = var.deploy_clickhouse ? 1 : 0
+  depends_on      = [aws_iam_role_policy_attachment.clickhouse_s3_access]
+  create_duration = "300s"
 }
 
 ###############################
-// ClickPipe Resource
+// S3 ClickPipe Resource (batch VPC Flow Logs pipeline)
 // ---------------------------------------------------------------------
-// Creates a ClickPipe for ingesting VPC Flow Logs from S3 to ClickHouse
+// Continuously polls the S3 bucket for new VPC Flow Log Parquet files
+// and ingests them into the vpc_flow_logs table in ClickHouse.
+//
+// Note: In provider v3.x the `state` attribute is read-only and the
+// `description` field has been removed; a ClickPipe is Running by default.
+// Use `stopped = true` to pause a pipe.
 ###############################
 resource "clickhouse_clickpipe" "vpc_flow_logs" {
-  count       = var.deploy_clickhouse && var.deploy_clickpipe ? 1 : 0
-  name        = "VPC Flow Logs Pipeline"
-  description = "Data pipeline from S3 VPC Flow Logs to ClickHouse"
+  count = var.deploy_clickhouse && var.deploy_clickpipe ? 1 : 0
+  name  = "VPC Flow Logs Pipeline"
 
   service_id = clickhouse_service.service[0].id
-  state      = "Running"
 
   source = {
     object_storage = {
-      type   = "s3"
-      format = var.clickpipe_format
-      url    = "s3://${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}/**"
-      # compression = "gzip" # Leaving this here for now
-      # delimiter      = " " # Leaving this here for now
+      type           = "s3"
+      format         = var.clickpipe_format
+      url            = "s3://${var.deploy_s3 ? aws_s3_bucket.flow_logs[0].bucket : var.s3_bucket_name}/**"
       authentication = "IAM_ROLE"
       iam_role       = aws_iam_role.clickhouse_role[0].arn
       is_continuous  = var.clickpipe_is_continuous

@@ -1,0 +1,102 @@
+#!/bin/bash
+# ---------------------------------------------------------------------
+# EC2 simulator bootstrap.
+#
+# Always:
+#   - generates outbound HTTPS traffic to example.com (drives VPC Flow Logs)
+#   - writes structured JSON application logs to /var/log/app/app.log
+#
+# When enable_cloudwatch_logs is true:
+#   - installs and configures the awslogs agent to ship
+#     /var/log/app/app.log to the demo CloudWatch Logs group, which feeds
+#     the Lambda transformer -> Kinesis -> ClickPipe streaming pipeline.
+# ---------------------------------------------------------------------
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+echo "[INFO] Starting user data script execution"
+
+yum update -y
+yum install -y curl
+
+mkdir -p /var/log/app
+touch /var/log/app/app.log
+chmod 0644 /var/log/app/app.log
+
+cat <<'SCRIPT' > /usr/local/bin/generate-traffic.sh
+#!/bin/bash
+# Emits one JSON-formatted log line per HTTP request to /var/log/app/app.log.
+# The awslogs agent (when enabled) tails this file and ships each line as a
+# discrete CloudWatch Logs event.
+
+APP_LOG=/var/log/app/app.log
+HOSTNAME=$(hostname -s)
+
+while true; do
+    REQUEST_ID=$(cat /proc/sys/kernel/random/uuid)
+    START_NS=$(date +%s%N)
+    HTTP_CODE=$(curl -s -o /dev/null -w '%%{http_code}' https://www.example.com || echo "000")
+    END_NS=$(date +%s%N)
+    LATENCY_MS=$(( (END_NS - START_NS) / 1000000 ))
+    STATUS="success"
+    if [ "$HTTP_CODE" != "200" ]; then STATUS="failure"; fi
+
+    printf '{"timestamp":"%s","level":"INFO","host":"%s","request_id":"%s","target":"www.example.com","http_code":%s,"latency_ms":%s,"status":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HOSTNAME" "$REQUEST_ID" "$HTTP_CODE" "$LATENCY_MS" "$STATUS" >> "$APP_LOG"
+
+    sleep 5
+done
+SCRIPT
+chmod +x /usr/local/bin/generate-traffic.sh
+
+cat <<'SERVICE' > /etc/systemd/system/traffic-generator.service
+[Unit]
+Description=Traffic Generator Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/generate-traffic.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable traffic-generator
+systemctl start traffic-generator
+echo "[INFO] Traffic generator started"
+
+%{ if enable_cloudwatch_logs ~}
+echo "[INFO] Configuring awslogs for streaming pipeline"
+
+# The awslogs extras topic is no longer available on current Amazon Linux 2
+# AMIs; install from the regular yum repo instead.
+yum install -y awslogs
+
+# Region for the awslogs CLI (must match the log group's region).
+sed -i "s|^region = .*|region = ${aws_region}|" /etc/awslogs/awscli.conf
+
+# Replace the stock config so we only ship the application JSON log.
+cat <<EOF > /etc/awslogs/awslogs.conf
+[general]
+state_file = /var/lib/awslogs/agent-state
+
+[/var/log/app/app.log]
+file = /var/log/app/app.log
+log_group_name = ${cloudwatch_log_group}
+log_stream_name = {instance_id}
+datetime_format = %Y-%m-%dT%H:%M:%SZ
+initial_position = start_of_file
+buffer_duration = 5000
+EOF
+
+systemctl enable awslogsd
+systemctl start awslogsd
+echo "[INFO] awslogs started, shipping /var/log/app/app.log to ${cloudwatch_log_group}"
+%{ else ~}
+echo "[INFO] CloudWatch Logs pipeline disabled; awslogs not configured"
+%{ endif ~}
+
+echo "[INFO] User data script execution completed"

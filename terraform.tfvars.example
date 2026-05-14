@@ -5,12 +5,21 @@
 aws_region = "ap-southeast-1"
 
 # Deployment Flags
-deploy_vpc = true
-deploy_s3 = true
-deploy_flow_logs = true
-deploy_simulator = true
+# ----------------
+# Batch pipeline (VPC -> S3 -> ClickPipe -> vpc_flow_logs table)
+deploy_vpc        = true
+deploy_s3         = true
+deploy_flow_logs  = true
+deploy_simulator  = true
 deploy_clickhouse = true
-deploy_clickpipe = true
+deploy_clickpipe  = true
+
+# Streaming pipeline (CloudWatch Logs -> Lambda -> Kinesis -> ClickPipe -> cloudwatch_logs table)
+# Toggle all four together to enable the end-to-end streaming demo.
+deploy_cloudwatch_logs      = true
+deploy_kinesis_stream       = true
+deploy_lambda_transformer   = true
+deploy_cloudwatch_clickpipe = true
 
 # VPC Configuration
 vpc_cidr = "10.0.0.0/16"
@@ -105,8 +114,46 @@ clickpipe_columns = [
 ]
 
 # IAM Configuration
-# The IAM Role needs to start with the prefix "ClickHouseAccess-" 
+# The IAM Role needs to start with the prefix "ClickHouseAccess-"
 clickhouse_iam_role_name = "ClickHouseAccess-ClickPipe-S3-Demo"
+
+# ---------------------------------------------------------------------
+# Streaming pipeline configuration (CloudWatch Logs -> Kinesis -> ClickPipe)
+# ---------------------------------------------------------------------
+
+# CloudWatch Logs
+cloudwatch_log_group_name              = "/apac-sa-demo/app"
+cloudwatch_log_retention_days          = 7
+cloudwatch_subscription_filter_pattern = ""  # forward all events; tighten if needed
+
+# Kinesis Data Stream
+kinesis_stream_name     = "apac-sa-demo-log-stream"
+kinesis_stream_mode     = "ON_DEMAND"  # or "PROVISIONED" with kinesis_shard_count
+kinesis_shard_count     = 1            # only honored when stream_mode = PROVISIONED
+kinesis_retention_hours = 24
+
+# Lambda transformer
+lambda_function_name = "apac-sa-demo-cw-to-kinesis"
+lambda_iam_role_name = "apac-sa-demo-cw-to-kinesis-role"
+
+# Kinesis ClickPipe — IAM role must use the ClickHouseAccess- prefix to match
+# the trust convention enforced by ClickHouse Cloud for ClickPipes.
+clickhouse_kinesis_iam_role_name          = "ClickHouseAccess-ClickPipe-Kinesis-Demo"
+cloudwatch_clickpipe_format               = "JSONEachRow"
+cloudwatch_clickpipe_iterator_type        = "LATEST"
+cloudwatch_clickpipe_use_enhanced_fan_out = false
+cloudwatch_clickpipe_table_name           = "cloudwatch_logs"
+
+# Default columns match what lambda/cw_to_kinesis.py emits. Override if you
+# change the Lambda payload shape.
+cloudwatch_clickpipe_columns = [
+  { name = "log_group",  type = "String" },
+  { name = "log_stream", type = "String" },
+  { name = "owner",      type = "String" },
+  { name = "timestamp",  type = "UInt64" },
+  { name = "id",         type = "String" },
+  { name = "message",    type = "String" },
+]
 
 # Sensitive values should be placed in secret.tfvars file
 # See secret.tfvars.example for format
